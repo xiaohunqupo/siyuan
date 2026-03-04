@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,11 +18,59 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/88250/gulu"
 	"github.com/gin-gonic/gin"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
+
+func sendDeviceNotification(c *gin.Context) {
+	ret := gulu.Ret.NewResult()
+	defer c.JSON(http.StatusOK, ret)
+
+	arg, ok := util.JsonArg(c, ret)
+	if !ok {
+		return
+	}
+
+	if util.ContainerAndroid != util.Container {
+		ret.Code = -1
+		ret.Msg = "Just support Android"
+		return
+	}
+
+	var title string
+	if nil != arg["title"] {
+		title = strings.TrimSpace(arg["title"].(string))
+	} else {
+		ret.Code = -1
+		ret.Msg = "title can't be empty"
+		return
+	}
+
+	var body string
+	if nil != arg["body"] {
+		body = strings.TrimSpace(arg["body"].(string))
+	} else {
+		ret.Code = -1
+		ret.Msg = "body can't be empty"
+		return
+	}
+
+	var delayInSeconds int
+	if nil != arg["delayInSeconds"] {
+		delayInSeconds = int(arg["delayInSeconds"].(float64))
+	} else {
+		delayInSeconds = 1
+	}
+
+	util.BroadcastByType("main", "sendDeviceNotification", 0, "", map[string]interface{}{
+		"title":          title,
+		"body":           body,
+		"delayInSeconds": delayInSeconds,
+	})
+}
 
 func pushMsg(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
@@ -33,7 +81,13 @@ func pushMsg(c *gin.Context) {
 		return
 	}
 
-	msg := arg["msg"].(string)
+	msg := strings.TrimSpace(arg["msg"].(string))
+	if "" == msg {
+		ret.Code = -1
+		ret.Msg = "msg can't be empty"
+		return
+	}
+
 	timeout := 7000
 	if nil != arg["timeout"] {
 		timeout = int(arg["timeout"].(float64))
