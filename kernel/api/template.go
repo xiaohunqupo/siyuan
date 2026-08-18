@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - From thought to insight, with agents
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,13 +18,32 @@ package api
 
 import (
 	"net/http"
+	"path/filepath"
 
 	"github.com/88250/gulu"
-	"github.com/88250/lute/html"
 	"github.com/gin-gonic/gin"
 	"github.com/siyuan-note/siyuan/kernel/model"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
+
+func renderSprig(c *gin.Context) {
+	ret := gulu.Ret.NewResult()
+	defer c.JSON(http.StatusOK, ret)
+
+	arg, ok := util.JsonArg(c, ret)
+	if !ok {
+		return
+	}
+
+	template := arg["template"].(string)
+	content, err := model.RenderGoTemplate(template)
+	if err != nil {
+		ret.Code = -1
+		ret.Msg = util.EscapeHTML(err.Error())
+		return
+	}
+	ret.Data = content
+}
 
 func docSaveAsTemplate(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
@@ -36,11 +55,12 @@ func docSaveAsTemplate(c *gin.Context) {
 	}
 
 	id := arg["id"].(string)
+	name := arg["name"].(string)
 	overwrite := arg["overwrite"].(bool)
-	code, err := model.DocSaveAsTemplate(id, overwrite)
-	if nil != err {
+	code, err := model.DocSaveAsTemplate(id, name, overwrite)
+	if err != nil {
 		ret.Code = -1
-		ret.Msg = html.EscapeString(err.Error())
+		ret.Msg = util.EscapeHTML(err.Error())
 		return
 	}
 	ret.Code = code
@@ -57,15 +77,56 @@ func renderTemplate(c *gin.Context) {
 
 	p := arg["path"].(string)
 	id := arg["id"].(string)
-	content, err := model.RenderTemplate(p, id)
-	if nil != err {
-		ret.Code = -1
-		ret.Msg = html.EscapeString(err.Error())
+	if util.InvalidIDPattern(id, ret) {
 		return
 	}
 
-	ret.Data = map[string]interface{}{
+	if !util.IsAbsPathInWorkspace(p) {
+		ret.Code = -1
+		ret.Msg = "Path [" + p + "] is not in workspace"
+		return
+	}
+
+	// 模板路径必须限定在 <data>/templates/ 目录内，防止通过工作空间内任意路径读取敏感文件（如 conf/conf.json）
+	if !isPathInTemplatesDir(p) {
+		ret.Code = -1
+		ret.Msg = "Path [" + p + "] is not in templates directory"
+		return
+	}
+
+	preview := false
+	if previewArg := arg["preview"]; nil != previewArg {
+		preview = previewArg.(bool)
+	}
+
+	_, content, err := model.RenderTemplate(p, id, preview)
+	if err != nil {
+		ret.Code = -1
+		ret.Msg = util.EscapeHTML(err.Error())
+		return
+	}
+
+	ret.Data = map[string]any{
 		"path":    p,
 		"content": content,
 	}
+}
+
+// isPathInTemplatesDir 校验绝对路径是否位于 <data>/templates/ 目录内，解析符号链接后再次校验，
+// 防止通过符号链接指向模板目录外的敏感文件
+func isPathInTemplatesDir(p string) bool {
+	abs := filepath.Clean(p)
+	templatesRoot := filepath.Clean(filepath.Join(util.DataDir, "templates"))
+	if !gulu.File.IsSubPath(templatesRoot, abs) {
+		return false
+	}
+	realRoot, err := filepath.EvalSymlinks(templatesRoot)
+	if nil != err {
+		return false
+	}
+	realPath, err := filepath.EvalSymlinks(abs)
+	if nil != err {
+		return false
+	}
+	return gulu.File.IsSubPath(realRoot, realPath)
 }
