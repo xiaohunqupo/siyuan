@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - From thought to insight, with agents
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,19 +17,30 @@
 package api
 
 import (
+	"html"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/88250/gulu"
+	"github.com/88250/lute"
 	"github.com/88250/lute/ast"
 	"github.com/88250/lute/parse"
 	"github.com/88250/lute/render"
-	"github.com/88250/protyle"
+	"github.com/PuerkitoBio/goquery"
 	"github.com/gin-gonic/gin"
+	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/model"
+	"github.com/siyuan-note/siyuan/kernel/treenode"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
+
+// maxSpinBlockDOMBytes 限制 spinBlockDOM 输入 DOM 的最大字节数。
+const maxSpinBlockDOMBytes = 1024 * 1024
+
+// maxHTML2BlockDOMRequestBytes 限制 html2BlockDOM 请求体的最大字节数。
+const maxHTML2BlockDOMRequestBytes int64 = 128 * 1024 * 1024
 
 func copyStdMarkdown(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
@@ -41,35 +52,122 @@ func copyStdMarkdown(c *gin.Context) {
 	}
 
 	id := arg["id"].(string)
-	ret.Data = model.CopyStdMarkdown(id)
+	assetsDestSpace2Underscore := false
+	if nil != arg["assetsDestSpace2Underscore"] {
+		assetsDestSpace2Underscore = arg["assetsDestSpace2Underscore"].(bool)
+	}
+
+	fillCSSVar := false
+	if nil != arg["fillCSSVar"] {
+		fillCSSVar = arg["fillCSSVar"].(bool)
+	}
+
+	adjustHeadingLevel := false
+	if nil != arg["adjustHeadingLevel"] {
+		adjustHeadingLevel = arg["adjustHeadingLevel"].(bool)
+	}
+
+	imgTag := false
+	if nil != arg["imgTag"] {
+		imgTag = arg["imgTag"].(bool)
+	}
+
+	isReadOnlyRole := model.IsReadOnlyRoleContext(c)
+	var publishAccess model.PublishAccess
+	var accessChecker model.EmbedBlockAccessChecker
+	if isReadOnlyRole {
+		publishAccess = model.GetPublishAccess()
+		accessChecker = func(blockID string) bool {
+			return model.CheckBlockIdAccessableByPublishAccess(c, publishAccess, blockID)
+		}
+	}
+	markdownContent := model.ExportStdMarkdown(id, assetsDestSpace2Underscore, fillCSSVar, adjustHeadingLevel, imgTag, accessChecker)
+	if isReadOnlyRole {
+		bt := treenode.GetBlockTree(id)
+		if bt != nil {
+			markdownContent = model.FilterContentByPublishAccess(c, publishAccess, bt.BoxID, bt.Path, markdownContent, true)
+		}
+	}
+	ret.Data = markdownContent
 }
 
 func html2BlockDOM(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
 	defer c.JSON(http.StatusOK, ret)
+	limitHTML2BlockDOMRequestBody(c, maxHTML2BlockDOMRequestBytes)
 
 	arg, ok := util.JsonArg(c, ret)
 	if !ok {
 		return
 	}
 
-	dom := arg["dom"].(string)
-	luteEngine := model.NewLute()
-	markdown, err := luteEngine.HTML2Markdown(dom)
-	if nil != err {
-		ret.Data = "Failed to convert"
+	var dom string
+	if !util.ParseJsonArgs(arg, ret, util.BindJsonArg("dom", &dom, true, false)) {
+		return
+	}
+	// 可选 notebook 参数：指定目标加密笔记本时资源写入 box 内并加密
+	boxID := ""
+	if notebook, ok := arg["notebook"].(string); ok && notebook != "" {
+		if model.IsEncryptedBox(notebook) {
+			boxID = notebook
+		}
+	}
+	if err := holdEncryptedBoxRequest(c, boxID); err != nil {
+		ret.Code = -1
+		ret.Msg = err.Error()
+		return
+	}
+	text, _ := arg["text"].(string)
+	mathML, _ := arg["mathML"].(string)
+	office, _ := arg["office"].(string)
+	officeMathHTML, _ := arg["officeMathHTML"].(string)
+	wps, _ := arg["wps"].(string)
+	skipLocalAssets, _ := arg["skipLocalAssets"].(bool)
+	skipBase64Assets, _ := arg["skipBase64Assets"].(bool)
+	skipInlineSVGAssets, _ := arg["skipInlineSVGAssets"].(bool)
+	preflight, _ := arg["preflight"].(bool)
+	preparedHTML, _ := arg["preparedHTML"].(bool)
+	preserveSourceFormat, _ := arg["preserveSourceFormat"].(bool)
+	luteEngine := util.NewLute()
+	luteEngine.SetHTMLTag2TextMark(true)
+	luteEngine.SetHTML2MarkdownAttrs([]string{"alias", "memo", "bookmark", "custom-*"})
+	dom, useHTML := prepareHTMLClipboardContent(luteEngine, dom, text, mathML, office, officeMathHTML, wps,
+		preserveSourceFormat, preparedHTML, convertClipboardMath, convertOfficeHTMLClipboardMath)
+	if !useHTML {
+		if preflight {
+			ret.Data = map[string]any{"converted": true, "dom": dom, "useHTML": false}
+		} else {
+			ret.Data = dom
+		}
+		return
+	}
+	if preflight {
+		skipLocalAssets = true
+		skipBase64Assets = true
+		skipInlineSVGAssets = true
+	}
+	normalizedHTML := dom
+	tree, _ := model.HTML2TreeWithOptions(dom, luteEngine, boxID, model.HTML2TreeOptions{
+		SkipBase64Assets:    skipBase64Assets,
+		SkipInlineSVGAssets: skipInlineSVGAssets,
+	})
+	if nil == tree {
+		if preflight {
+			ret.Data = map[string]any{"converted": false, "dom": "Failed to convert", "normalizedHTML": normalizedHTML, "useHTML": true}
+		} else {
+			ret.Data = "Failed to convert"
+		}
 		return
 	}
 
 	var unlinks []*ast.Node
-	tree := parse.Parse("", []byte(markdown), luteEngine.ParseOptions)
 	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
 		if !entering {
 			return ast.WalkContinue
 		}
 
 		if ast.NodeListItem == n.Type && nil == n.FirstChild {
-			newNode := protyle.NewParagraph()
+			newNode := treenode.NewParagraph("")
 			n.AppendChild(newNode)
 			n.SetIALAttr("updated", util.TimeFromID(newNode.ID))
 			return ast.WalkSkipChildren
@@ -82,7 +180,33 @@ func html2BlockDOM(c *gin.Context) {
 		n.Unlink()
 	}
 
-	if "std" == model.Conf.System.Container {
+	// 表格只包含一个单元格时，将其转换为段落
+	// Copy one cell from Excel/HTML table and paste it using the cell's content https://github.com/siyuan-note/siyuan/issues/9614
+	unlinks = nil
+	if nil != tree.Root.FirstChild && ast.NodeTable == tree.Root.FirstChild.Type && (nil == tree.Root.FirstChild.Next ||
+		(ast.NodeKramdownBlockIAL == tree.Root.FirstChild.Next.Type && nil == tree.Root.FirstChild.Next.Next)) {
+		if nil != tree.Root.FirstChild.FirstChild && ast.NodeTableHead == tree.Root.FirstChild.FirstChild.Type {
+			head := tree.Root.FirstChild.FirstChild
+			if nil == head.Next && nil != head.FirstChild && nil == head.FirstChild.Next {
+				row := head.FirstChild
+				if nil != row.FirstChild && nil == row.FirstChild.Next {
+					cell := row.FirstChild
+					p := treenode.NewParagraph("")
+					var contents []*ast.Node
+					for c := cell.FirstChild; nil != c; c = c.Next {
+						contents = append(contents, c)
+					}
+					for _, c := range contents {
+						p.AppendChild(c)
+					}
+					tree.Root.FirstChild.Unlink()
+					tree.Root.PrependChild(p)
+				}
+			}
+		}
+	}
+
+	if util.ContainerStd == model.Conf.System.Container && !skipLocalAssets {
 		// 处理本地资源文件复制
 		ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
 			if !entering || ast.NodeLinkDest != n.Type {
@@ -97,12 +221,21 @@ func html2BlockDOM(c *gin.Context) {
 			if strings.HasPrefix(localPath, "http") {
 				return ast.WalkContinue
 			}
-
-			localPath = strings.TrimPrefix(localPath, "file://")
-			if gulu.OS.IsWindows() {
-				localPath = strings.TrimPrefix(localPath, "/")
+			localPath = util.FileURLToLocalPath(localPath)
+			if !filepath.IsAbs(localPath) {
+				// Kernel crash when copy-pasting from some browsers https://github.com/siyuan-note/siyuan/issues/9203
+				return ast.WalkContinue
 			}
 			if !gulu.File.IsExist(localPath) {
+				return ast.WalkContinue
+			}
+
+			if util.IsSensitivePath(localPath) {
+				logging.LogWarnf("skip copying asset [%s] due to sensitive path", localPath)
+				return ast.WalkContinue
+			}
+			if encryptedBoxID := model.EncryptedRawPathBoxID(localPath); encryptedBoxID != "" {
+				logging.LogWarnf("skip copying asset [%s] from encrypted notebook [%s]", localPath, encryptedBoxID)
 				return ast.WalkContinue
 			}
 
@@ -110,19 +243,229 @@ func html2BlockDOM(c *gin.Context) {
 			ext := filepath.Ext(name)
 			name = name[0 : len(name)-len(ext)]
 			name = name + "-" + ast.NewNodeID() + ext
-			targetPath := filepath.Join(util.DataDir, "assets", name)
-			if err = gulu.File.CopyFile(localPath, targetPath); nil != err {
-				util.LogErrorf("copy asset from [%s] to [%s] failed: %s", localPath, targetPath, err)
+
+			data, readErr := os.ReadFile(localPath)
+			if readErr != nil {
+				logging.LogErrorf("read asset [%s] failed: %s", localPath, readErr)
 				return ast.WalkStop
 			}
-			n.Tokens = gulu.Str.ToBytes("assets/" + name)
+			assetsDir := filepath.Join(util.DataDir, "assets")
+			if boxID != "" {
+				assetsDir = filepath.Join(util.DataDir, boxID, "assets")
+			}
+			storedName, storeErr := model.StoreAssetForBox(boxID, assetsDir, name, data)
+			if storeErr != nil {
+				logging.LogErrorf("store asset [%s] failed: %s", localPath, storeErr)
+				return ast.WalkStop
+			}
+			assetURL := "assets/" + storedName
+			if boxID != "" {
+				assetURL += "?box=" + boxID
+			}
+			n.Tokens = gulu.Str.ToBytes(assetURL)
 			return ast.WalkContinue
 		})
 	}
 
-	renderer := render.NewBlockRenderer(tree, luteEngine.RenderOptions)
+	parse.TextMarks2Inlines(tree) // 先将 TextMark 转换为 Inlines https://github.com/siyuan-note/siyuan/issues/13056
+	parse.NestedInlines2FlattedSpansHybrid(tree, false)
+	removeWhitespaceTextMarkStyles(tree)
+
+	md, err := lute.FormatNodeSync(tree.Root, luteEngine.ParseOptions, luteEngine.RenderOptions)
+	if nil != err {
+		if preflight {
+			ret.Data = map[string]any{"converted": false, "dom": "Failed to convert", "normalizedHTML": normalizedHTML, "useHTML": true}
+		} else {
+			ret.Data = "Failed to convert"
+		}
+		return
+	}
+
+	tree = parse.Parse("", []byte(md), luteEngine.ParseOptions)
+	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if entering && ast.NodeIFrame == n.Type {
+			normalizeIFramePosition(n)
+		}
+		return ast.WalkContinue
+	})
+	renderer := render.NewProtyleRenderer(tree, luteEngine.RenderOptions, luteEngine.ParseOptions)
 	output := renderer.Render()
-	ret.Data = gulu.Str.FromBytes(output)
+	if preflight {
+		ret.Data = map[string]any{"converted": true, "normalizedHTML": normalizedHTML, "useHTML": true}
+	} else {
+		ret.Data = gulu.Str.FromBytes(output)
+	}
+}
+
+func removeWhitespaceTextMarkStyles(tree *parse.Tree) {
+	var unlinks []*ast.Node
+	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if entering && n.Type == ast.NodeTextMark && strings.TrimSpace(n.TextMarkTextContent) == "" {
+			n.RemoveIALAttr("style")
+			// 空白文本无法绑定 Kramdown 行内属性，移除样式属性节点以免渲染为正文。
+			if n.Next != nil && n.Next.Type == ast.NodeKramdownSpanIAL && parse.IALVal(n.Next, "style") != "" {
+				unlinks = append(unlinks, n.Next)
+			}
+		}
+		return ast.WalkContinue
+	})
+	for _, n := range unlinks {
+		n.Unlink()
+	}
+}
+
+func normalizeIFramePosition(node *ast.Node) {
+	// iframe 的绝对或固定定位依赖原网页容器，粘贴后需让块保留在文档流中。
+	if isOutOfFlowPosition(node.IALAttr("style")) {
+		node.RemoveIALAttr("style")
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(node.TokensStr()))
+	if err != nil {
+		return
+	}
+	iframe := doc.Find("iframe").First()
+	style, exists := iframe.Attr("style")
+	if !exists || !isOutOfFlowPosition(style) {
+		return
+	}
+
+	iframe.RemoveAttr("style")
+	if normalized, renderErr := goquery.OuterHtml(iframe); renderErr == nil {
+		node.Tokens = []byte(normalized)
+	}
+}
+
+func isOutOfFlowPosition(style string) bool {
+	position := ""
+	for _, declaration := range strings.Split(style, ";") {
+		property, value, ok := strings.Cut(declaration, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(property), "position") {
+			continue
+		}
+		value = strings.ToLower(strings.TrimSpace(value))
+		value = strings.TrimSpace(strings.TrimSuffix(value, "!important"))
+		position = value
+	}
+	return position == "absolute" || position == "fixed"
+}
+
+func limitHTML2BlockDOMRequestBody(c *gin.Context, maxBytes int64) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+}
+
+type clipboardMathConverter func(mathML, office, wps string) (markdown string, converted bool)
+type officeHTMLClipboardMathConverter func(officeMathHTML string) (markdown string, converted bool)
+
+func prepareHTMLClipboardContent(luteEngine *lute.Lute, dom, text, mathML, office, officeMathHTML, wps string,
+	preserveSourceFormat, preparedHTML bool, mathConverter clipboardMathConverter,
+	officeHTMLMathConverter officeHTMLClipboardMathConverter) (resolvedDOM string, useHTML bool) {
+	if preparedHTML {
+		return dom, true
+	}
+	resolvedDOM, useHTML = resolveHTMLClipboardContent(luteEngine, dom, mathML, office, officeMathHTML, wps,
+		mathConverter, officeHTMLMathConverter)
+	if !useHTML {
+		return resolvedDOM, false
+	}
+	// 将 Word 和 WPS 批注转换为行级备注 https://github.com/siyuan-note/siyuan/issues/18748
+	resolvedDOM = normalizeWPSComments(resolvedDOM, text, wps)
+	resolvedDOM = normalizeMSWordComments(resolvedDOM)
+	if !preserveSourceFormat {
+		resolvedDOM = matchHTMLClipboardElements(resolvedDOM)
+	}
+	return resolvedDOM, true
+}
+
+func resolveHTMLClipboardContent(luteEngine *lute.Lute, dom, mathML, office, officeMathHTML, wps string,
+	mathConverter clipboardMathConverter, officeHTMLMathConverter officeHTMLClipboardMathConverter) (resolvedDOM string, useHTML bool) {
+	// 将 Word 和 WPS 公式转换为可编辑公式 https://github.com/siyuan-note/siyuan/issues/18747
+	if markdown, converted := mathConverter(mathML, office, wps); converted {
+		luteEngine.SetInlineMath(true)
+		return luteEngine.Md2BlockDOM(markdown, false), false
+	}
+	if markdown, converted := officeHTMLMathConverter(officeMathHTML); converted {
+		luteEngine.SetInlineMath(true)
+		return luteEngine.Md2BlockDOM(markdown, false), false
+	}
+	return dom, true
+}
+
+func normalizeMSWordComments(dom string) string {
+	if !strings.Contains(dom, "mso-comment") && !strings.Contains(dom, "MsoComment") && !strings.Contains(dom, "msocom") {
+		return dom
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(dom))
+	if err != nil {
+		return dom
+	}
+
+	comments := map[string]string{}
+	doc.Find(`[id^="_com_"]`).Each(func(_ int, comment *goquery.Selection) {
+		id, _ := comment.Attr("id")
+		var paragraphs []string
+		comment.Find(".MsoCommentText").Each(func(_ int, paragraph *goquery.Selection) {
+			paragraph = paragraph.Clone()
+			paragraph.Find(".MsoCommentReference, .msocomoff").Remove()
+			if text := strings.TrimSpace(paragraph.Text()); text != "" {
+				paragraphs = append(paragraphs, text)
+			}
+		})
+		if 0 < len(paragraphs) {
+			comments[strings.TrimPrefix(id, "_com_")] = strings.Join(paragraphs, "\n")
+		}
+	})
+
+	doc.Find("a[style]").Each(func(_ int, anchor *goquery.Selection) {
+		style, _ := anchor.Attr("style")
+		if !strings.Contains(strings.ToLower(style), "mso-comment-reference:") {
+			return
+		}
+		if href, exists := anchor.Attr("href"); exists && href != "" {
+			return
+		}
+
+		content, err := anchor.Html()
+		if err != nil {
+			return
+		}
+		comment := comments[msWordCommentID(anchor, style)]
+		if comment == "" {
+			anchor.ReplaceWithHtml(content)
+			return
+		}
+		anchor.ReplaceWithHtml(`<span title="` + html.EscapeString(comment) + `">` + content + `</span>`)
+	})
+
+	doc.Find(".MsoCommentReference, .msocomanchor, .msocomoff").Remove()
+	doc.Find("[style]").Each(func(_ int, selection *goquery.Selection) {
+		style, _ := selection.Attr("style")
+		if strings.Contains(strings.ToLower(style), "mso-element:comment-list") {
+			selection.Remove()
+		}
+	})
+
+	ret, err := doc.Find("body").Html()
+	if err != nil {
+		return dom
+	}
+	return ret
+}
+
+func msWordCommentID(anchor *goquery.Selection, style string) string {
+	if href, exists := anchor.Next().Find(`a[href^="#_msocom_"]`).First().Attr("href"); exists {
+		return strings.TrimPrefix(href, "#_msocom_")
+	}
+
+	style = style[strings.Index(strings.ToLower(style), "mso-comment-reference:")+len("mso-comment-reference:"):]
+	if semicolon := strings.IndexByte(style, ';'); 0 <= semicolon {
+		style = style[:semicolon]
+	}
+	if underscore := strings.LastIndexByte(style, '_'); 0 <= underscore {
+		return strings.TrimSpace(style[underscore+1:])
+	}
+	return ""
 }
 
 func spinBlockDOM(c *gin.Context) {
@@ -134,11 +477,55 @@ func spinBlockDOM(c *gin.Context) {
 		return
 	}
 
-	dom := arg["dom"].(string)
+	var dom string
+	if !util.ParseJsonArgs(arg, ret, util.BindJsonArg("dom", &dom, true, false)) {
+		return
+	}
+	if len(dom) > maxSpinBlockDOMBytes {
+		// 限制输入大小，避免解析超大 DOM 导致资源消耗
+		ret.Code = http.StatusRequestEntityTooLarge
+		ret.Msg = "dom input exceeds the maximum permitted size"
+		return
+	}
 	luteEngine := model.NewLute()
 
 	dom = luteEngine.SpinBlockDOM(dom)
-	ret.Data = map[string]interface{}{
+	ret.Data = map[string]any{
 		"dom": dom,
+	}
+}
+
+// md2HTML 将 Markdown 转换为 HTML。
+func md2HTML(c *gin.Context) {
+	ret := gulu.Ret.NewResult()
+	defer c.JSON(http.StatusOK, ret)
+
+	arg, ok := util.JsonArg(c, ret)
+	if !ok {
+		return
+	}
+
+	var markdown, mode string
+	if !util.ParseJsonArgs(arg, ret,
+		util.BindJsonArg("markdown", &markdown, true, false),
+		util.BindJsonArg("mode", &mode, false, false),
+	) {
+		return
+	}
+
+	var html string
+	switch mode {
+	case "protyle-preview":
+		html = model.MarkdownToProtylePreviewHTML(markdown)
+	case "":
+		html = model.MarkdownToMarkdownStrHTML(markdown)
+	default:
+		ret.Code = -1
+		ret.Msg = "unknown [mode]"
+		return
+	}
+
+	ret.Data = map[string]any{
+		"html": html,
 	}
 }
